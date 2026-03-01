@@ -100,12 +100,14 @@ def style_axes_black_grid(fig, x_range=(0, 300), title=""):
 st.set_page_config(page_title="Current Conductor Loss & Temp Rise", layout="wide")
 
 st.markdown(
-    "<h2 style='margin-bottom:0.2rem;'>Current Conductor Loss & Temperature Rise (Furnace)</h2>",
+    "<h2 style='margin-bottom:0.2rem;'>Current Conductor Loss, Voltage Drop & Temperature Rise (Furnace)</h2>",
     unsafe_allow_html=True
 )
 
-st.caption("Resistance loss (I²R) and radiation-only temperature rise estimate inside a hot furnace. "
-           "This is an engineering approximation; gas convection and end conduction are not included.")
+st.caption(
+    "Resistance loss (I²R), voltage drop (I·R), and radiation-only temperature rise estimate inside a hot furnace. "
+    "Engineering approximation: convection and end conduction are not included."
+)
 
 st.markdown("---")
 st.subheader("Input Parameters")
@@ -138,7 +140,7 @@ with c7:
         emissivity = st.number_input("ε (0.1–0.95)", min_value=0.10, max_value=0.95, value=float(mat["emissivity"]), step=0.01)
     else:
         emissivity = float(mat["emissivity"])
-    st.write("")  # spacer
+    st.write("")
 with c8:
     st.metric("ε used", f"{emissivity:.2f}")
 
@@ -172,7 +174,11 @@ rho_T = resistivity_at_T(mat["rho0"], mat["alpha"], T_furnace_K)
 
 L_m = length_mm / 1000.0
 R_ohm = rho_T * L_m / max(A_cs, 1e-20)
+
+# Loss & voltage drop at selected current
 P_loss_W = (current_a ** 2) * R_ohm
+Vdrop_oneway = current_a * R_ohm
+Vdrop_roundtrip = current_a * (2.0 * R_ohm)
 
 T_rod_K = solve_Trod_radiation(P_loss_W, emissivity, A_surf, T_furnace_K)
 deltaT_C = T_rod_K - T_furnace_K
@@ -185,17 +191,18 @@ qpp = P_loss_W / max(A_surf, 1e-20)  # W/m^2
 st.markdown("---")
 st.subheader("Results")
 
-r1, r2, r3, r4, r5 = st.columns(5)
+r1, r2, r3, r4, r5, r6 = st.columns(6)
 r1.metric("Resistivity ρ(T) (Ω·m)", f"{rho_T:.3e}")
 r2.metric("Resistance R (Ω)", f"{R_ohm:.6g}")
-r3.metric("Power loss I²R (W)", f"{P_loss_W:.2f}")
-r4.metric("Rod/Plate temp (°C)", f"{T_rod_K - 273.15:.1f}")
-r5.metric("ΔT (°C) (radiation-only)", f"{deltaT_C:.1f}")
+r3.metric("Voltage drop (one-way) (V)", f"{Vdrop_oneway:.4f}")
+r4.metric("Voltage drop (round-trip) (V)", f"{Vdrop_roundtrip:.4f}")
+r5.metric("Power loss I²R (W)", f"{P_loss_W:.2f}")
+r6.metric("ΔT (°C) (radiation-only)", f"{deltaT_C:.1f}")
 
-st.caption(f"Heat flux (P/A_surface): {qpp:.3g} W/m²")
+st.caption(f"Rod/Plate temperature ≈ {T_rod_K - 273.15:.1f} °C    |    Heat flux (P/A_surface): {qpp:.3g} W/m²")
 
 # ============================
-# Plot: ΔT vs Current (0–300A fixed)
+# Sweep plots (0–300A fixed)
 # ============================
 st.markdown("---")
 st.subheader("Sweep Plot (Current axis fixed: 0–300A)")
@@ -203,34 +210,38 @@ st.subheader("Sweep Plot (Current axis fixed: 0–300A)")
 currents = np.linspace(0.0, 300.0, 121)
 deltaTs = []
 powers = []
+v_one = []
+v_round = []
 
 for I in currents:
     P = (I ** 2) * R_ohm
     Trod = solve_Trod_radiation(P, emissivity, A_surf, T_furnace_K)
     deltaTs.append(Trod - T_furnace_K)
     powers.append(P)
+    v_one.append(I * R_ohm)
+    v_round.append(I * 2.0 * R_ohm)
 
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=currents, y=deltaTs, mode="lines", name="ΔT"))
+# ΔT vs I
+figT = go.Figure()
+figT.add_trace(go.Scatter(x=currents, y=deltaTs, mode="lines", name="ΔT"))
+figT.update_layout(xaxis_title="Current (A)", yaxis_title="Temperature rise ΔT (°C)")
+style_axes_black_grid(figT, x_range=(0, 300), title="Temperature Rise ΔT vs Current")
+st.plotly_chart(figT, use_container_width=True)
 
-fig.update_layout(
-    xaxis_title="Current (A)",
-    yaxis_title="Temperature rise ΔT (°C)",
-)
-style_axes_black_grid(fig, x_range=(0, 300), title="Temperature Rise ΔT vs Current")
-
-st.plotly_chart(fig, use_container_width=True)
-
-# Optional second plot (power) — comment out if you don't want it
 with st.expander("Show power loss (I²R) vs Current"):
     figP = go.Figure()
     figP.add_trace(go.Scatter(x=currents, y=powers, mode="lines", name="I²R"))
-    figP.update_layout(
-        xaxis_title="Current (A)",
-        yaxis_title="Power loss I²R (W)",
-    )
+    figP.update_layout(xaxis_title="Current (A)", yaxis_title="Power loss I²R (W)")
     style_axes_black_grid(figP, x_range=(0, 300), title="Power Loss I²R vs Current")
     st.plotly_chart(figP, use_container_width=True)
+
+with st.expander("Show voltage drop vs Current"):
+    figV = go.Figure()
+    figV.add_trace(go.Scatter(x=currents, y=v_one, mode="lines", name="ΔV one-way"))
+    figV.add_trace(go.Scatter(x=currents, y=v_round, mode="lines", name="ΔV round-trip"))
+    figV.update_layout(xaxis_title="Current (A)", yaxis_title="Voltage drop ΔV (V)")
+    style_axes_black_grid(figV, x_range=(0, 300), title="Voltage Drop ΔV vs Current")
+    st.plotly_chart(figV, use_container_width=True)
 
 # ============================
 # Simple warnings
@@ -240,8 +251,10 @@ if P_loss_W > 50:
     warns.append("Power loss is > 50 W (check acceptable loss).")
 if deltaT_C > 50:
     warns.append("Estimated ΔT > 50°C (check oxidation/creep/supports).")
+if Vdrop_roundtrip > 0.5:
+    warns.append("Round-trip voltage drop > 0.5 V (check system voltage margin).")
 
 if warns:
     st.warning("\n".join([f"- {w}" for w in warns]))
 else:
-    st.success("No immediate warnings for the selected condition (based on this simplified radiation-only model).")
+    st.success("No immediate warnings for the selected condition (based on this simplified model).")
