@@ -3,51 +3,86 @@ import streamlit as st
 import plotly.graph_objects as go
 
 # ============================
-# Properties (engineering approx)
+# Material properties
 # ============================
+# For Copper / Pure Nickel: linear model from 20°C
+# For Crofer22: measured points (700/800/900°C) and interpolation
 MATERIALS = {
-    "Copper":      {"rho0": 1.68e-8, "alpha": 0.0039, "emissivity": 0.70},
-    "Pure Nickel": {"rho0": 6.99e-8, "alpha": 0.0060, "emissivity": 0.80},
-    "Crofer22":    {"rho0": 1.20e-6, "alpha": 0.0010, "emissivity": 0.85},
+    "Copper": {
+        "model": "linear",
+        "rho0_ohm_m": 1.68e-8,     # at 20°C
+        "alpha_1_per_K": 0.0039,
+        "emissivity": 0.70,
+    },
+    "Pure Nickel": {
+        "model": "linear",
+        "rho0_ohm_m": 6.99e-8,     # at 20°C
+        "alpha_1_per_K": 0.0060,
+        "emissivity": 0.80,
+    },
+    "Crofer22": {
+        "model": "measured_interp",
+        # Measured representative values (Excel): ρ700/800/900 in µΩ·cm
+        # Convert: (µΩ·cm) -> (Ω·m) by ×1e-8
+        # because 1 µΩ·cm = 1e-6 Ω·cm = 1e-8 Ω·m
+        "T_C_points": [700.0, 800.0, 900.0],
+        "rho_uohm_cm_points": [110.0, 115.0, 117.5],
+        "emissivity": 0.85,
+    },
 }
 
 SIGMA = 5.670374419e-8  # Stefan–Boltzmann [W/m^2/K^4]
-T_REF = 293.15          # 20°C in K
+T_REF_K = 293.15        # 20°C in K
 
 
 # ============================
 # Helpers
 # ============================
-def resistivity_at_T(rho0, alpha, T_K):
+def uohm_cm_to_ohm_m(x_uohm_cm: float) -> float:
+    # 1 µΩ·cm = 1e-8 Ω·m
+    return float(x_uohm_cm) * 1e-8
+
+
+def rho_linear(rho0_ohm_m: float, alpha_1_per_K: float, T_K: float) -> float:
     """ρ(T) = ρ0*(1 + α*(T - Tref))"""
-    return max(rho0 * (1.0 + alpha * (T_K - T_REF)), 1e-20)
+    return max(rho0_ohm_m * (1.0 + alpha_1_per_K * (T_K - T_REF_K)), 1e-20)
 
 
-def geom_rod(d_mm, L_mm):
-    d = max(d_mm, 1e-6) / 1000.0
-    L = max(L_mm, 1e-6) / 1000.0
-    A_cs = np.pi * (d / 2.0) ** 2
-    A_surf = np.pi * d * L  # ends neglected
-    label = f"Rod: d={d_mm:.3g} mm, L={L_mm:.3g} mm"
+def rho_crofer_interp(T_C: float, T_points_C, rho_points_uohm_cm) -> float:
+    """Piecewise linear interpolation on measured ρ(T) points. Clamped outside range."""
+    T_points_C = np.array(T_points_C, dtype=float)
+    rho_points = np.array([uohm_cm_to_ohm_m(v) for v in rho_points_uohm_cm], dtype=float)
+
+    # Clamp outside range (so it doesn't extrapolate wildly)
+    if T_C <= T_points_C.min():
+        return float(rho_points[0])
+    if T_C >= T_points_C.max():
+        return float(rho_points[-1])
+
+    return float(np.interp(T_C, T_points_C, rho_points))
+
+
+def geom_rod(d_mm: float, L_mm: float):
+    d_m = max(d_mm, 1e-9) / 1000.0
+    L_m = max(L_mm, 1e-9) / 1000.0
+    A_cs = np.pi * (d_m / 2.0) ** 2
+    A_surf = np.pi * d_m * L_m  # ends neglected
+    label = f"Rod: d={d_mm:g} mm, L={L_mm:g} mm"
     return A_cs, A_surf, label
 
 
-def geom_plate(w_mm, t_mm, L_mm):
-    w = max(w_mm, 1e-6) / 1000.0
-    t = max(t_mm, 1e-6) / 1000.0
-    L = max(L_mm, 1e-6) / 1000.0
-    A_cs = w * t
-    A_surf = 2.0 * (w + t) * L  # ends neglected
-    label = f"Plate: w={w_mm:.3g} mm, t={t_mm:.3g} mm, L={L_mm:.3g} mm"
+def geom_plate(w_mm: float, t_mm: float, L_mm: float):
+    w_m = max(w_mm, 1e-9) / 1000.0
+    t_m = max(t_mm, 1e-9) / 1000.0
+    L_m = max(L_mm, 1e-9) / 1000.0
+    A_cs = w_m * t_m
+    A_surf = 2.0 * (w_m + t_m) * L_m  # ends neglected
+    label = f"Plate: w={w_mm:g} mm, t={t_mm:g} mm, L={L_mm:g} mm"
     return A_cs, A_surf, label
 
 
-def solve_Trod_radiation(P_W, eps, A_surf, T_furnace_K):
-    """
-    Radiation-only balance:
-      P = eps*sigma*A*(Trod^4 - Tf^4)
-      => Trod = (P/(eps*sigma*A) + Tf^4)^(1/4)
-    """
+def solve_Trod_radiation(P_W: float, eps: float, A_surf: float, T_furnace_K: float) -> float:
+    """Radiation-only: P = eps*sigma*A*(Trod^4 - Tf^4)"""
     if P_W <= 0:
         return T_furnace_K
     denom = max(eps * SIGMA * max(A_surf, 1e-20), 1e-20)
@@ -94,6 +129,24 @@ def style_axes_black_grid(fig, x_range=(0, 300), title=""):
     return fig
 
 
+def compute_rho(material_name: str, furnace_temp_c: float) -> tuple[float, str]:
+    """Return rho(T) in Ω·m and a short model description."""
+    mat = MATERIALS[material_name]
+    model = mat["model"]
+
+    if model == "linear":
+        T_K = furnace_temp_c + 273.15
+        rho = rho_linear(mat["rho0_ohm_m"], mat["alpha_1_per_K"], T_K)
+        return rho, f"Linear from 20°C: ρ(T)=ρ0(1+αΔT), ρ0={mat['rho0_ohm_m']:.3e}, α={mat['alpha_1_per_K']:.4f}"
+    elif model == "measured_interp":
+        rho = rho_crofer_interp(furnace_temp_c, mat["T_C_points"], mat["rho_uohm_cm_points"])
+        pts = ", ".join([f"{T:g}°C→{v:g} µΩ·cm" for T, v in zip(mat["T_C_points"], mat["rho_uohm_cm_points"])])
+        return rho, f"Measured interpolation (clamped): {pts}"
+    else:
+        # fallback
+        return 1e-6, "Unknown model (fallback)"
+
+
 # ============================
 # UI
 # ============================
@@ -106,41 +159,34 @@ st.markdown(
 
 st.caption(
     "Resistance loss (I²R), voltage drop (I·R), and radiation-only temperature rise estimate inside a hot furnace. "
-    "Engineering approximation: convection and end conduction are not included."
+    "Crofer22 uses measured-point interpolation (700/800/900°C)."
 )
 
 st.markdown("---")
 st.subheader("Input Parameters")
 
 c1, c2, c3, c4 = st.columns(4)
-
 with c1:
     shape = st.selectbox("Shape", ["Rod", "Plate"])
-
 with c2:
     furnace_temp_c = st.number_input("Furnace Temperature (°C)", min_value=600.0, max_value=800.0, value=700.0, step=5.0)
-
 with c3:
     current_a = st.number_input("Current (A)", min_value=0.0, max_value=300.0, value=150.0, step=1.0)
-
 with c4:
     length_mm = st.number_input("Length (mm)", min_value=10.0, max_value=5000.0, value=500.0, step=10.0)
 
 c5, c6, c7, c8 = st.columns(4)
-
 with c5:
     material_name = st.selectbox("Material", list(MATERIALS.keys()))
-
 mat = MATERIALS[material_name]
 
 with c6:
     eps_mode = st.selectbox("Emissivity ε", ["Use material default", "Manual"])
 with c7:
     if eps_mode == "Manual":
-        emissivity = st.number_input("ε (0.1–0.95)", min_value=0.10, max_value=0.95, value=float(mat["emissivity"]), step=0.01)
+        emissivity = st.number_input("ε (0.10–0.95)", min_value=0.10, max_value=0.95, value=float(mat["emissivity"]), step=0.01)
     else:
         emissivity = float(mat["emissivity"])
-    st.write("")
 with c8:
     st.metric("ε used", f"{emissivity:.2f}")
 
@@ -169,21 +215,20 @@ st.caption(f"Geometry: {geom_label}")
 # ============================
 # Calculations
 # ============================
-T_furnace_K = furnace_temp_c + 273.15
-rho_T = resistivity_at_T(mat["rho0"], mat["alpha"], T_furnace_K)
+rho_T, rho_model_note = compute_rho(material_name, furnace_temp_c)
 
 L_m = length_mm / 1000.0
 R_ohm = rho_T * L_m / max(A_cs, 1e-20)
 
-# Loss & voltage drop at selected current
 P_loss_W = (current_a ** 2) * R_ohm
 Vdrop_oneway = current_a * R_ohm
 Vdrop_roundtrip = current_a * (2.0 * R_ohm)
 
+T_furnace_K = furnace_temp_c + 273.15
 T_rod_K = solve_Trod_radiation(P_loss_W, emissivity, A_surf, T_furnace_K)
 deltaT_C = T_rod_K - T_furnace_K
 
-qpp = P_loss_W / max(A_surf, 1e-20)  # W/m^2
+qpp = P_loss_W / max(A_surf, 1e-20)
 
 # ============================
 # Results
@@ -199,7 +244,8 @@ r4.metric("Voltage drop (round-trip) (V)", f"{Vdrop_roundtrip:.4f}")
 r5.metric("Power loss I²R (W)", f"{P_loss_W:.2f}")
 r6.metric("ΔT (°C) (radiation-only)", f"{deltaT_C:.1f}")
 
-st.caption(f"Rod/Plate temperature ≈ {T_rod_K - 273.15:.1f} °C    |    Heat flux (P/A_surface): {qpp:.3g} W/m²")
+st.caption(f"Rod/Plate temperature ≈ {T_rod_K - 273.15:.1f} °C    |    Heat flux: {qpp:.3g} W/m²")
+st.info(f"ρ(T) model: {rho_model_note}")
 
 # ============================
 # Sweep plots (0–300A fixed)
